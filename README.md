@@ -8,6 +8,14 @@ Standalone API for real-time queue length monitoring and individual wait-time an
 - **Wait Time Tracking:** Centroid tracking keeps persistent track IDs across frames per camera to count exact queue duration.
 - **Prometheus Metrics:** Integrated metrics for latency, requests, and queue limit violations.
 
+## How count and wait times work
+
+- **Queue count** is the number of currently tracked people whose bottom-middle point is inside the configured queue ROI polygon.
+- **Per-person wait** starts from the first frame where that tracked person enters the ROI and keeps increasing while they remain inside it.
+- **Average wait** is the average wait time of the people currently inside the ROI.
+- **Max wait** is the longest wait time among the people currently inside the ROI.
+- When a person leaves the ROI or disappears from tracking, their finished wait is stored internally, but it is not used for the live `average_wait_time` and `max_wait_time` values.
+
 ## API Usage
 
 ### 1. Health Checks

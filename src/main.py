@@ -10,6 +10,7 @@ import asyncio
 import base64
 import logging
 import time
+import threading
 import concurrent.futures
 from typing import Optional, List, Dict
 from contextlib import asynccontextmanager
@@ -131,6 +132,9 @@ _thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 _trackers: Dict[str, CentroidTracker] = {}
 _active_queues: Dict[str, Dict[int, float]] = {}  # camera_id -> {track_id -> entry_timestamp}
 _completed_waits: Dict[str, List[float]] = {}  # camera_id -> list of wait durations
+_camera_locks: Dict[str, threading.Lock] = {}
+_state_lock = threading.Lock()
+_inference_lock = threading.Lock()
 
 # ── App ───────────────────────────────────────────────────────
 @asynccontextmanager
@@ -242,9 +246,11 @@ def _is_inside_roi(point: tuple, roi_polygon: np.ndarray) -> bool:
 
 def _run_inference(img: np.ndarray, camera_id: str):
     """Run YOLO prediction and update tracking/wait times."""
-    results = _model.predict(img, conf=CONFIDENCE_THRESHOLD, classes=[0], verbose=False)
+    with _inference_lock:
+        results = _model.predict(img, conf=CONFIDENCE_THRESHOLD, classes=[0], verbose=False)
     
     rects = []
+    confidences_by_rect = {}
     for result in results:
         boxes = result.boxes
         if boxes is None or len(boxes) == 0:
@@ -252,93 +258,92 @@ def _run_inference(img: np.ndarray, camera_id: str):
         xyxy = boxes.xyxy.cpu().int().tolist()
         confs = boxes.conf.cpu().tolist()
         for bbox, conf in zip(xyxy, confs):
-            rects.append((bbox[0], bbox[1], bbox[2], bbox[3]))
+            rect = (bbox[0], bbox[1], bbox[2], bbox[3])
+            rects.append(rect)
+            confidences_by_rect[rect] = float(conf)
 
-    # Retrieve or create tracker for this camera
-    if camera_id not in _trackers:
-        _trackers[camera_id] = CentroidTracker(max_disappeared=15)
-        _active_queues[camera_id] = {}
-        _completed_waits[camera_id] = []
+    with _state_lock:
+        if camera_id not in _trackers:
+            _trackers[camera_id] = CentroidTracker(max_disappeared=15)
+            _active_queues[camera_id] = {}
+            _completed_waits[camera_id] = []
+            _camera_locks[camera_id] = threading.Lock()
+        camera_lock = _camera_locks[camera_id]
 
-    tracker = _trackers[camera_id]
-    active_queue = _active_queues[camera_id]
-    completed_list = _completed_waits[camera_id]
-    
-    tracked_objects = tracker.update(rects)
-    current_time = time.time()
-    
-    roi_polygon = get_roi_for_camera(camera_id)
-    
-    # Process tracked objects
-    persons = []
-    current_tracked_ids = set()
-    
-    for object_id, info in tracked_objects.items():
-        cX, cY, x1, y1, x2, y2 = info
-        current_tracked_ids.add(object_id)
+    with camera_lock:
+        tracker = _trackers[camera_id]
+        active_queue = _active_queues[camera_id]
+        completed_list = _completed_waits[camera_id]
         
-        # Use bottom-middle point of the bounding box to test ROI presence (more standard for queues)
-        bottom_mid_point = (int((x1 + x2) / 2), y2)
-        inside = _is_inside_roi(bottom_mid_point, roi_polygon)
+        tracked_objects = tracker.update(rects)
+        current_time = time.time()
         
-        # Handle entering queue
-        if inside:
-            if object_id not in active_queue:
-                active_queue[object_id] = current_time
-                logger.info(f"[{camera_id}] Track ID {object_id} entered the queue zone.")
+        roi_polygon = get_roi_for_camera(camera_id)
+        
+        # Process tracked objects
+        persons = []
+        current_tracked_ids = set()
+        
+        for object_id, info in tracked_objects.items():
+            cX, cY, x1, y1, x2, y2 = info
+            current_tracked_ids.add(object_id)
             
-            wait_time = current_time - active_queue[object_id]
-        else:
-            # If outside but was previously in queue, trigger a queue leave
-            if object_id in active_queue:
+            # Use bottom-middle point of the bounding box to test ROI presence.
+            bottom_mid_point = (int((x1 + x2) / 2), y2)
+            inside = _is_inside_roi(bottom_mid_point, roi_polygon)
+            
+            # Handle entering queue
+            if inside:
+                if object_id not in active_queue:
+                    active_queue[object_id] = current_time
+                    logger.info(f"[{camera_id}] Track ID {object_id} entered the queue zone.")
+                
+                wait_time = current_time - active_queue[object_id]
+            else:
+                # If outside but was previously in queue, trigger a queue leave
+                if object_id in active_queue:
+                    wait_duration = current_time - active_queue[object_id]
+                    completed_list.append(wait_duration)
+                    if len(completed_list) > 100:  # Keep list bounded
+                        completed_list.pop(0)
+                    logger.info(f"[{camera_id}] Track ID {object_id} exited queue zone. Wait duration: {wait_duration:.2f}s.")
+                    del active_queue[object_id]
+                
+                wait_time = 0.0
+
+            confidence = confidences_by_rect.get((x1, y1, x2, y2), 0.90)
+
+            persons.append(PersonBBox(
+                x1=x1,
+                y1=y1,
+                x2=x2,
+                y2=y2,
+                confidence=confidence,
+                track_id=object_id,
+                wait_time_seconds=wait_time,
+                inside_roi=inside
+            ))
+
+        # Deregister/cleanup active queue items that are no longer tracked
+        for object_id in list(active_queue.keys()):
+            if object_id not in current_tracked_ids:
+                # Person left camera entirely
                 wait_duration = current_time - active_queue[object_id]
                 completed_list.append(wait_duration)
-                if len(completed_list) > 100:  # Keep list bounded
+                if len(completed_list) > 100:
                     completed_list.pop(0)
-                logger.info(f"[{camera_id}] Track ID {object_id} exited queue zone. Wait duration: {wait_duration:.2f}s.")
+                logger.info(f"[{camera_id}] Track ID {object_id} left tracking. Total wait duration: {wait_duration:.2f}s.")
                 del active_queue[object_id]
-            
-            wait_time = 0.0
 
-        # Confidence is calculated by matching original rects if needed, or default as general
-        # Find corresponding prediction confidence score
-        confidence = 0.90
-        for rect, conf in zip(rects, [b.conf.cpu().item() for r in results for b in r.boxes]):
-            if rect == (x1, y1, x2, y2):
-                confidence = conf
-                break
+        # Calculate metrics
+        queue_length = len(active_queue)
+        
+        current_wait_times = [current_time - start_t for start_t in active_queue.values()]
+        max_wait = max(current_wait_times) if current_wait_times else 0.0
+        
+        avg_wait = np.mean(current_wait_times) if current_wait_times else 0.0
 
-        persons.append(PersonBBox(
-            x1=x1,
-            y1=y1,
-            x2=x2,
-            y2=y2,
-            confidence=confidence,
-            track_id=object_id,
-            wait_time_seconds=wait_time,
-            inside_roi=inside
-        ))
-
-    # Deregister/cleanup active queue items that are no longer tracked
-    for object_id in list(active_queue.keys()):
-        if object_id not in current_tracked_ids:
-            # Person left camera entirely
-            wait_duration = current_time - active_queue[object_id]
-            completed_list.append(wait_duration)
-            if len(completed_list) > 100:
-                completed_list.pop(0)
-            logger.info(f"[{camera_id}] Track ID {object_id} left tracking. Total wait duration: {wait_duration:.2f}s.")
-            del active_queue[object_id]
-
-    # Calculate metrics
-    queue_length = len(active_queue)
-    
-    current_wait_times = [current_time - start_t for start_t in active_queue.values()]
-    max_wait = max(current_wait_times) if current_wait_times else 0.0
-    
-    avg_wait = np.mean(completed_list) if completed_list else (np.mean(current_wait_times) if current_wait_times else 0.0)
-
-    return int(queue_length), float(avg_wait), float(max_wait), persons
+        return int(queue_length), float(avg_wait), float(max_wait), persons
 
 
 # ── Endpoints ─────────────────────────────────────────────────
