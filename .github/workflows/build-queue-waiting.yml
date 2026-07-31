@@ -1,31 +1,60 @@
+# ---------------------------------------------------------------------------
 # Workflow to build and deploy the Queue & Waiting Service
-# Triggers on push to main/dev/staging branches and manual dispatch
+# ---------------------------------------------------------------------------
+# This CI/CD pipeline automates the full delivery cycle for the Queue &
+# Waiting analytics microservice:
+#   1. Builds a Docker image from the repository Dockerfile
+#   2. Pushes the image to Docker Hub with multiple tags for traceability
+#   3. Updates the DevOps (GitOps) repository with the new image tag
+#   4. ArgoCD detects the change and auto-syncs the deployment in Kubernetes
+#
+# Triggers:
+#   - Push to main, dev, or staging branches (only on core file changes)
+#   - Manual dispatch from the GitHub Actions UI (workflow_dispatch)
+# ---------------------------------------------------------------------------
 name: Build and Deploy Queue & Waiting Service
 
+# ---------------------------------------------------------------------------
+# Trigger configuration
+# ---------------------------------------------------------------------------
+# The workflow runs automatically when changes are pushed to main, dev, or
+# staging branches. To avoid unnecessary runs, it only triggers when files
+# in the specified paths are modified. A manual trigger is also available.
+# ---------------------------------------------------------------------------
 on:
   push:
     branches:
-      - main
-      - dev
-      - staging
+      - main      # Production branch
+      - dev       # Development branch
+      - staging   # Staging / pre-production branch
     # Only trigger on changes to core files (skip docs, config, etc.)
     paths:
-      - 'src/**'
-      - 'models/**'
-      - 'Dockerfile'
-      - 'requirements.txt'
-      - '.github/workflows/build-queue-waiting.yml'
+      - 'src/**'                                            # Application source code
+      - 'models/**'                                         # YOLO model weights
+      - 'Dockerfile'                                        # Container build definition
+      - 'requirements.txt'                                  # Python dependencies
+      - '.github/workflows/build-queue-waiting.yml'         # This workflow file itself
   # Allow manual trigger from GitHub Actions UI
   workflow_dispatch:
 
+# ---------------------------------------------------------------------------
 # Global environment variables shared across all jobs and steps
+# ---------------------------------------------------------------------------
 env:
   # Docker Hub repository name for the queue & waiting service image
+  # This is used as the base name for all image tags pushed to the registry
   IMAGE_NAME: kishore2712/godezk_device_queue_waiting
 
+# ---------------------------------------------------------------------------
+# Jobs
+# ---------------------------------------------------------------------------
+# This workflow has a single job that handles building, pushing, and
+# updating the DevOps repo. The job runs on the latest Ubuntu runner.
+# ---------------------------------------------------------------------------
 jobs:
   # Main job to build Docker image and push to registry
   build-and-push:
+    # Use the latest Ubuntu runner provided by GitHub-hosted runners
     runs-on: ubuntu-latest
 
     steps:
@@ -64,6 +93,8 @@ jobs:
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       # Step 5: Set up Docker Buildx for advanced build features
+      # Buildx enables multi-platform builds, advanced layer caching, and
+      # other features not available with the default Docker builder
       - name: Set up Docker Buildx
         # Enable multi-platform builds and layer caching
         uses: docker/setup-buildx-action@v3
@@ -100,10 +131,17 @@ jobs:
           echo "**Tagged Image:** ${{ env.IMAGE_NAME }}:${{ steps.env.outputs.environment }}-${{ steps.sha.outputs.short }}" >> $GITHUB_STEP_SUMMARY
 
       # Step 8: Update DevOps repository with new image tag to trigger ArgoCD sync
+      # ---------------------------------------------------------------------
+      # This step clones the separate DevOps (GitOps) repository, updates the
+      # image tag in the kustomization.yaml for the corresponding environment,
+      # and pushes the change. ArgoCD watches this repo and will automatically
+      # sync the new image tag to the Kubernetes cluster.
+      # ---------------------------------------------------------------------
+      # Skip for PRs; update kustomization.yaml in devops repo to trigger ArgoCD sync
       - name: Update DevOps repo with new image tag
-        # Skip for PRs; update kustomization.yaml in devops repo to trigger ArgoCD sync
         if: steps.env.outputs.environment != 'pr'
         env:
+          # Personal Access Token with write access to the DevOps repo
           DEVOPS_PAT: ${{ secrets.DEVOPS_PAT }}
         run: |
           # Configure git identity for automated commits
