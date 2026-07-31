@@ -1,0 +1,114 @@
+# Workflow to build and deploy the Queue & Waiting Service
+# Triggers on push to main/dev/staging branches and manual dispatch
+name: Build and Deploy Queue & Waiting Service
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+      - staging
+    # Only trigger on changes to core files (skip docs, config, etc.)
+    paths:
+      - 'src/**'
+      - 'models/**'
+      - 'Dockerfile'
+      - 'requirements.txt'
+      - '.github/workflows/build-queue-waiting.yml'
+  # Allow manual trigger from GitHub Actions UI
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: kishore2712/godezk_device_queue_waiting
+
+jobs:
+  # Main job to build Docker image and push to registry
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Checkout the repository code
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Step 2: Determine deployment environment based on branch
+      - name: Set environment
+        id: env
+        # Map git branch to deployment environment (main -> production)
+        run: |
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            echo "environment=production" >> $GITHUB_OUTPUT
+          else
+            echo "environment=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          fi
+
+      # Step 3: Compute short SHA for image tagging
+      - name: Compute short SHA
+        id: sha
+        run: echo "short=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+
+      # Step 4: Authenticate with Docker Hub
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      # Step 5: Set up Docker Buildx for advanced build features
+      - name: Set up Docker Buildx
+        # Enable multi-platform builds and layer caching
+        uses: docker/setup-buildx-action@v3
+
+      # Step 6: Build and push Docker image with multiple tags
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          # Tag with: latest, full SHA, and environment-friendly short tag (e.g., dev-abc1234)
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:${{ steps.env.outputs.environment }}-${{ steps.sha.outputs.short }}
+          # Use registry cache for faster builds
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+      # Step 7: Generate deployment summary for GitHub UI
+      - name: Deployment summary
+        run: |
+          echo "### Deployment Summary :rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ steps.env.outputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** ${{ env.IMAGE_NAME }}:${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Tagged Image:** ${{ env.IMAGE_NAME }}:${{ steps.env.outputs.environment }}-${{ steps.sha.outputs.short }}" >> $GITHUB_STEP_SUMMARY
+
+      # Step 8: Update DevOps repository with new image tag to trigger ArgoCD sync
+      - name: Update DevOps repo with new image tag
+        # Skip for PRs; update kustomization.yaml in devops repo to trigger ArgoCD sync
+        if: steps.env.outputs.environment != 'pr'
+        env:
+          DEVOPS_PAT: ${{ secrets.DEVOPS_PAT }}
+        run: |
+          git config --global user.email "ci@godezk-device.com"
+          git config --global user.name "GoDezk Device CI"
+
+          git clone https://kishorek421:${DEVOPS_PAT}@github.com/kishorek421/godezk_device_devops.git devops
+          cd devops
+
+          BRANCH_NAME="${{ steps.env.outputs.environment }}"
+          if [ "$BRANCH_NAME" = "production" ]; then
+            BRANCH_NAME="main"
+          fi
+          git checkout $BRANCH_NAME || git checkout -b $BRANCH_NAME
+
+          cd k8s/services/queue_waiting/overlays/$BRANCH_NAME
+
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          sed -i "s|newTag:.*|newTag: ${{ steps.env.outputs.environment }}-${SHORT_SHA}|g" kustomization.yaml
+
+          git add kustomization.yaml
+          git diff --staged --quiet || git commit -m "ci: update queue-waiting ${{ steps.env.outputs.environment }} image to ${SHORT_SHA}"
+          git pull --rebase origin $BRANCH_NAME
+          git push origin $BRANCH_NAME
