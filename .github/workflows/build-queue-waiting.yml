@@ -18,7 +18,9 @@ on:
   # Allow manual trigger from GitHub Actions UI
   workflow_dispatch:
 
+# Global environment variables shared across all jobs and steps
 env:
+  # Docker Hub repository name for the queue & waiting service image
   IMAGE_NAME: kishore2712/godezk_device_queue_waiting
 
 jobs:
@@ -28,10 +30,15 @@ jobs:
 
     steps:
       # Step 1: Checkout the repository code
+      # Pulls the latest commit from the triggered branch into the runner workspace
       - name: Checkout code
         uses: actions/checkout@v4
 
       # Step 2: Determine deployment environment based on branch
+      # Maps the pushed branch name to a deployment environment label:
+      #   main    -> production
+      #   dev     -> dev
+      #   staging -> staging
       - name: Set environment
         id: env
         # Map git branch to deployment environment (main -> production)
@@ -43,11 +50,13 @@ jobs:
           fi
 
       # Step 3: Compute short SHA for image tagging
+      # Extracts the first 7 characters of the commit SHA for human-readable image tags
       - name: Compute short SHA
         id: sha
         run: echo "short=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
 
       # Step 4: Authenticate with Docker Hub
+      # Uses repository secrets DOCKER_USERNAME and DOCKER_PASSWORD for registry login
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
@@ -60,6 +69,11 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       # Step 6: Build and push Docker image with multiple tags
+      # Builds the image from the Dockerfile and pushes it to Docker Hub with three tags:
+      #   1. :latest                     - always points to the most recent build
+      #   2. :<full-sha>                 - unique per commit for traceability
+      #   3. :<env>-<short-sha>          - environment-friendly tag (e.g., dev-abc1234)
+      # Registry caching is used to speed up subsequent builds by reusing cached layers
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
@@ -76,6 +90,7 @@ jobs:
           cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
 
       # Step 7: Generate deployment summary for GitHub UI
+      # Writes a markdown summary to the GitHub Actions run page for quick visibility
       - name: Deployment summary
         run: |
           echo "### Deployment Summary :rocket:" >> $GITHUB_STEP_SUMMARY
@@ -91,23 +106,31 @@ jobs:
         env:
           DEVOPS_PAT: ${{ secrets.DEVOPS_PAT }}
         run: |
+          # Configure git identity for automated commits
           git config --global user.email "ci@godezk-device.com"
           git config --global user.name "GoDezk Device CI"
 
+          # Clone the DevOps repo using a PAT stored in repository secrets
           git clone https://kishorek421:${DEVOPS_PAT}@github.com/kishorek421/godezk_device_devops.git devops
           cd devops
 
+          # Determine the target branch in the DevOps repo
+          # production environment maps to the main branch in the DevOps repo
           BRANCH_NAME="${{ steps.env.outputs.environment }}"
           if [ "$BRANCH_NAME" = "production" ]; then
             BRANCH_NAME="main"
           fi
           git checkout $BRANCH_NAME || git checkout -b $BRANCH_NAME
 
+          # Navigate to the kustomize overlay for this service and environment
           cd k8s/services/queue_waiting/overlays/$BRANCH_NAME
 
+          # Update the image tag in kustomization.yaml to the newly built image
           SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
           sed -i "s|newTag:.*|newTag: ${{ steps.env.outputs.environment }}-${SHORT_SHA}|g" kustomization.yaml
 
+          # Commit and push the updated kustomization.yaml
+          # ArgoCD watches this repo and will auto-sync the new image tag
           git add kustomization.yaml
           git diff --staged --quiet || git commit -m "ci: update queue-waiting ${{ steps.env.outputs.environment }} image to ${SHORT_SHA}"
           git pull --rebase origin $BRANCH_NAME
