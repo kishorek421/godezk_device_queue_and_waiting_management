@@ -1,13 +1,6 @@
 # ---------------------------------------------------------------------------
 # Workflow to build and deploy the Queue & Waiting Service
 # ---------------------------------------------------------------------------
-# This CI/CD pipeline automates the full delivery cycle for the Queue &
-# Waiting analytics microservice:
-#   1. Builds a Docker image from the repository Dockerfile
-#   2. Pushes the image to Docker Hub with multiple tags for traceability
-#   3. Updates the DevOps (GitOps) repository with the new image tag
-#   4. ArgoCD detects the change and auto-syncs the deployment in Kubernetes
-#
 # Triggers:
 #   - Push to main, dev, or staging branches (only on core file changes)
 #   - Manual dispatch from the GitHub Actions UI (workflow_dispatch)
@@ -16,10 +9,6 @@ name: Build and Deploy Queue & Waiting Service
 
 # ---------------------------------------------------------------------------
 # Trigger configuration
-# ---------------------------------------------------------------------------
-# The workflow runs automatically when changes are pushed to main, dev, or
-# staging branches. To avoid unnecessary runs, it only triggers when files
-# in the specified paths are modified. A manual trigger is also available.
 # ---------------------------------------------------------------------------
 on:
   push:
@@ -43,7 +32,7 @@ on:
 env:
   # Docker Hub repository name for the queue & waiting service image
   # This is used as the base name for all image tags pushed to the registry
-  IMAGE_NAME: kishore2712/godezk_device_queue_waiting
+  IMAGE_NAME: kishore2712/godezk_device_queue_and_waiting_management
 
 # ---------------------------------------------------------------------------
 # Jobs
