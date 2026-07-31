@@ -18,5 +18,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY models ./models
 COPY src ./src
 
-EXPOSE 8014
-CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8014", "--workers", "1"]
+EXPOSE 8004
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8004", "--workers", "1"]
