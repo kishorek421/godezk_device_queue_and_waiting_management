@@ -33,6 +33,14 @@ LOG_LEVEL            = os.environ.get("LOG_LEVEL", "INFO")
 # Default ROI: whole frame if not specified
 DEFAULT_ROI = [[0, 0], [4096, 0], [4096, 4096], [0, 4096]]
 
+# Tracking / wait-time tuning
+MIN_QUEUE_HITS         = int(os.environ.get("MIN_QUEUE_HITS", "3"))
+MIN_TRACK_IOU          = float(os.environ.get("MIN_TRACK_IOU", "0.2"))
+MAX_TRACK_DISTANCE     = float(os.environ.get("MAX_TRACK_DISTANCE", "150.0"))
+MAX_TRACK_AGE          = int(os.environ.get("MAX_TRACK_AGE", "5"))
+MAX_TRACK_AGE_SECONDS  = float(os.environ.get("MAX_TRACK_AGE_SECONDS", "5.0"))
+INFERENCE_IMGSZ        = int(os.environ.get("INFERENCE_IMGSZ", "640"))
+
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -44,84 +52,169 @@ detection_requests  = Counter("queue_detection_requests_total",  "Total detectio
 queue_violations    = Counter("queue_limit_exceeded_total",      "Total queue limit violations")
 detection_latency   = Histogram("queue_detection_latency_seconds", "Detection latency")
 
-# ── Centroid Tracker ──────────────────────────────────────────
-class CentroidTracker:
-    """Centroid tracker to identify individuals across frames."""
-    def __init__(self, max_disappeared: int = 15):
-        self.next_object_id = 0
-        self.objects: Dict[int, tuple] = {}  # object_id -> (cX, cY, x1, y1, x2, y2)
-        self.disappeared: Dict[int, int] = {}  # object_id -> frame_count
-        self.max_disappeared = max_disappeared
+# ── Person Tracker ────────────────────────────────────────────
 
-    def register(self, bbox: tuple, centroid: tuple) -> int:
-        self.objects[self.next_object_id] = (centroid[0], centroid[1], bbox[0], bbox[1], bbox[2], bbox[3])
-        self.disappeared[self.next_object_id] = 0
-        self.next_object_id += 1
-        return self.next_object_id - 1
+def _centroid(bbox: tuple) -> tuple:
+    return ((bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0)
 
-    def deregister(self, object_id: int):
-        if object_id in self.objects:
-            del self.objects[object_id]
-        if object_id in self.disappeared:
-            del self.disappeared[object_id]
 
-    def update(self, rects: List[tuple]) -> Dict[int, tuple]:
-        if len(rects) == 0:
-            for object_id in list(self.disappeared.keys()):
-                self.disappeared[object_id] += 1
-                if self.disappeared[object_id] > self.max_disappeared:
-                    self.deregister(object_id)
-            return self.objects
+def _iou(box_a: tuple, box_b: tuple) -> float:
+    xA = max(box_a[0], box_b[0])
+    yA = max(box_a[1], box_b[1])
+    xB = min(box_a[2], box_b[2])
+    yB = min(box_a[3], box_b[3])
+    inter_w = max(0, xB - xA)
+    inter_h = max(0, yB - yA)
+    inter = inter_w * inter_h
+    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
+    area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
 
-        input_centroids = np.zeros((len(rects), 2), dtype="int")
-        for (i, (startX, startY, endX, endY)) in enumerate(rects):
-            cX = int((startX + endX) / 2.0)
-            cY = int((startY + endY) / 2.0)
-            input_centroids[i] = (cX, cY)
 
-        if len(self.objects) == 0:
-            for i in range(0, len(input_centroids)):
-                self.register(rects[i], input_centroids[i])
+def _centroid_distance(c_a: tuple, c_b: tuple) -> float:
+    return float(np.hypot(c_a[0] - c_b[0], c_a[1] - c_b[1]))
+
+
+class Track:
+    """A single tracked person with queue/wait state."""
+    __slots__ = (
+        "track_id", "bbox", "centroid", "confidence",
+        "hits", "misses", "state",
+        "first_seen", "last_seen",
+        "is_inside", "inside_hits", "first_inside_time",
+        "entry_time", "wait_time"
+    )
+
+    def __init__(self, track_id: int, bbox: tuple, confidence: float, now: float):
+        self.track_id = track_id
+        self.bbox = bbox
+        self.centroid = _centroid(bbox)
+        self.confidence = confidence
+        self.hits = 1
+        self.misses = 0
+        self.state = "PENDING"
+        self.first_seen = now
+        self.last_seen = now
+        self.is_inside = False
+        self.inside_hits = 0
+        self.first_inside_time: Optional[float] = None
+        self.entry_time: Optional[float] = None
+        self.wait_time = 0.0
+
+    def bottom_mid(self) -> tuple:
+        return (int(self.centroid[0]), int(self.bbox[3]))
+
+    def update(self, bbox: tuple, confidence: float, now: float):
+        self.bbox = bbox
+        self.centroid = _centroid(bbox)
+        self.confidence = confidence
+        self.last_seen = now
+        self.misses = 0
+        self.hits += 1
+
+    def mark_missed(self):
+        self.misses += 1
+
+    def is_dead(self, now: float, max_age: int, max_age_seconds: float) -> bool:
+        return self.misses > max_age or (now - self.last_seen) > max_age_seconds
+
+    def update_queue_state(self, now: float, inside: bool, min_hits: int) -> float:
+        completed_wait = 0.0
+        if inside:
+            self.inside_hits += 1
+            if self.first_inside_time is None:
+                self.first_inside_time = now
+            if self.state != "IN_QUEUE" and self.inside_hits >= min_hits:
+                self.state = "IN_QUEUE"
+                self.entry_time = self.first_inside_time
+            self.is_inside = True
         else:
-            object_ids = list(self.objects.keys())
-            object_centroids = [[val[0], val[1]] for val in self.objects.values()]
+            self.inside_hits = 0
+            self.first_inside_time = None
+            if self.state == "IN_QUEUE":
+                completed_wait = now - self.entry_time
+                self.state = "CONFIRMED_OUTSIDE"
+            self.is_inside = False
+        self.refresh_wait_time(now)
+        return completed_wait
 
-            # Compute Euclidean distances
-            D = np.linalg.norm(np.array(object_centroids)[:, np.newaxis] - input_centroids, axis=2)
+    def refresh_wait_time(self, now: float):
+        if self.state == "IN_QUEUE" and self.entry_time is not None:
+            self.wait_time = now - self.entry_time
+        else:
+            self.wait_time = 0.0
 
-            rows = D.min(axis=1).argsort()
-            cols = D.argmin(axis=1)[rows]
+    def complete_wait(self, now: float) -> float:
+        if self.state == "IN_QUEUE" and self.entry_time is not None:
+            return now - self.entry_time
+        return 0.0
 
-            used_rows = set()
-            used_cols = set()
 
-            for (row, col) in zip(rows, cols):
-                if row in used_rows or col in used_cols:
+class PersonTracker:
+    """Person tracker using IoU + centroid distance with stateful queue/wait logic."""
+    def __init__(
+        self,
+        min_hits: int = MIN_QUEUE_HITS,
+        min_iou: float = MIN_TRACK_IOU,
+        max_distance: float = MAX_TRACK_DISTANCE,
+        max_age: int = MAX_TRACK_AGE,
+        max_age_seconds: float = MAX_TRACK_AGE_SECONDS
+    ):
+        self.next_track_id = 0
+        self.tracks: List[Track] = []
+        self.min_hits = min_hits
+        self.min_iou = min_iou
+        self.max_distance = max_distance
+        self.max_age = max_age
+        self.max_age_seconds = max_age_seconds
+
+    def active_tracks(self) -> List[Track]:
+        return self.tracks
+
+    def update(self, detections: List[tuple], now: float) -> List[Track]:
+        # detections: list of ((x1,y1,x2,y2), confidence)
+        matched_track = set()
+        matched_det = set()
+
+        candidates = []
+        for ti, track in enumerate(self.tracks):
+            for di, (bbox, conf) in enumerate(detections):
+                iou = _iou(track.bbox, bbox)
+                dist = _centroid_distance(track.centroid, _centroid(bbox))
+                if iou >= self.min_iou:
+                    quality = iou + 1.0
+                elif dist <= self.max_distance:
+                    quality = 1.0 - (dist / (self.max_distance or 1.0))
+                else:
                     continue
+                candidates.append((quality, ti, di))
 
-                object_id = object_ids[row]
-                self.objects[object_id] = (
-                    input_centroids[col][0], input_centroids[col][1],
-                    rects[col][0], rects[col][1], rects[col][2], rects[col][3]
-                )
-                self.disappeared[object_id] = 0
+        candidates.sort(reverse=True)
 
-                used_rows.add(row)
-                used_cols.add(col)
+        for _, ti, di in candidates:
+            if ti in matched_track or di in matched_det:
+                continue
+            track = self.tracks[ti]
+            det = detections[di]
+            track.update(det[0], det[1], now)
+            matched_track.add(ti)
+            matched_det.add(di)
 
-            unused_rows = set(range(0, D.shape[0])).difference(used_rows)
-            unused_cols = set(range(0, D.shape[1])).difference(used_cols)
+        for ti, track in enumerate(self.tracks):
+            if ti not in matched_track:
+                track.mark_missed()
 
-            for row in unused_rows:
-                object_id = object_ids[row]
-                self.disappeared[object_id] += 1
-                if self.disappeared[object_id] > self.max_disappeared:
-                    self.deregister(object_id)
+        removed = [track for track in self.tracks if track.is_dead(now, self.max_age, self.max_age_seconds)]
+        self.tracks = [track for track in self.tracks if not track.is_dead(now, self.max_age, self.max_age_seconds)]
 
-            for col in unused_cols:
-                self.register(rects[col], input_centroids[col])
+        for di, (bbox, conf) in enumerate(detections):
+            if di not in matched_det:
+                new_track = Track(self.next_track_id, bbox, conf, now)
+                self.next_track_id += 1
+                self.tracks.append(new_track)
 
-        return self.objects
+        return removed
 
 
 # ── Global State ──────────────────────────────────────────────
@@ -129,9 +222,8 @@ _model = None
 _thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 
 # Per-camera trackers and wait times
-_trackers: Dict[str, CentroidTracker] = {}
-_active_queues: Dict[str, Dict[int, float]] = {}  # camera_id -> {track_id -> entry_timestamp}
-_completed_waits: Dict[str, List[float]] = {}  # camera_id -> list of wait durations
+_trackers: Dict[str, PersonTracker] = {}
+_completed_waits: Dict[str, List[float]] = {}  # camera_id -> list of completed wait durations
 _camera_locks: Dict[str, threading.Lock] = {}
 _state_lock = threading.Lock()
 _inference_lock = threading.Lock()
@@ -247,10 +339,16 @@ def _is_inside_roi(point: tuple, roi_polygon: np.ndarray) -> bool:
 def _run_inference(img: np.ndarray, camera_id: str):
     """Run YOLO prediction and update tracking/wait times."""
     with _inference_lock:
-        results = _model.predict(img, conf=CONFIDENCE_THRESHOLD, classes=[0], verbose=False)
-    
-    rects = []
-    confidences_by_rect = {}
+        results = _model.predict(
+            img,
+            conf=CONFIDENCE_THRESHOLD,
+            classes=[0],
+            verbose=False,
+            imgsz=INFERENCE_IMGSZ
+        )
+
+    now = time.monotonic()
+    detections = []
     for result in results:
         boxes = result.boxes
         if boxes is None or len(boxes) == 0:
@@ -258,90 +356,64 @@ def _run_inference(img: np.ndarray, camera_id: str):
         xyxy = boxes.xyxy.cpu().int().tolist()
         confs = boxes.conf.cpu().tolist()
         for bbox, conf in zip(xyxy, confs):
-            rect = (bbox[0], bbox[1], bbox[2], bbox[3])
-            rects.append(rect)
-            confidences_by_rect[rect] = float(conf)
+            detections.append(((bbox[0], bbox[1], bbox[2], bbox[3]), float(conf)))
 
     with _state_lock:
         if camera_id not in _trackers:
-            _trackers[camera_id] = CentroidTracker(max_disappeared=15)
-            _active_queues[camera_id] = {}
+            _trackers[camera_id] = PersonTracker()
             _completed_waits[camera_id] = []
             _camera_locks[camera_id] = threading.Lock()
         camera_lock = _camera_locks[camera_id]
 
     with camera_lock:
         tracker = _trackers[camera_id]
-        active_queue = _active_queues[camera_id]
         completed_list = _completed_waits[camera_id]
-        
-        tracked_objects = tracker.update(rects)
-        current_time = time.time()
-        
-        roi_polygon = get_roi_for_camera(camera_id)
-        
-        # Process tracked objects
-        persons = []
-        current_tracked_ids = set()
-        
-        for object_id, info in tracked_objects.items():
-            cX, cY, x1, y1, x2, y2 = info
-            current_tracked_ids.add(object_id)
-            
-            # Use bottom-middle point of the bounding box to test ROI presence.
-            bottom_mid_point = (int((x1 + x2) / 2), y2)
-            inside = _is_inside_roi(bottom_mid_point, roi_polygon)
-            
-            # Handle entering queue
-            if inside:
-                if object_id not in active_queue:
-                    active_queue[object_id] = current_time
-                    logger.info(f"[{camera_id}] Track ID {object_id} entered the queue zone.")
-                
-                wait_time = current_time - active_queue[object_id]
-            else:
-                # If outside but was previously in queue, trigger a queue leave
-                if object_id in active_queue:
-                    wait_duration = current_time - active_queue[object_id]
-                    completed_list.append(wait_duration)
-                    if len(completed_list) > 100:  # Keep list bounded
-                        completed_list.pop(0)
-                    logger.info(f"[{camera_id}] Track ID {object_id} exited queue zone. Wait duration: {wait_duration:.2f}s.")
-                    del active_queue[object_id]
-                
-                wait_time = 0.0
 
-            confidence = confidences_by_rect.get((x1, y1, x2, y2), 0.90)
-
-            persons.append(PersonBBox(
-                x1=x1,
-                y1=y1,
-                x2=x2,
-                y2=y2,
-                confidence=confidence,
-                track_id=object_id,
-                wait_time_seconds=wait_time,
-                inside_roi=inside
-            ))
-
-        # Deregister/cleanup active queue items that are no longer tracked
-        for object_id in list(active_queue.keys()):
-            if object_id not in current_tracked_ids:
-                # Person left camera entirely
-                wait_duration = current_time - active_queue[object_id]
-                completed_list.append(wait_duration)
+        removed = tracker.update(detections, now)
+        for track in removed:
+            completed_wait = track.complete_wait(now)
+            if completed_wait > 0:
+                completed_list.append(completed_wait)
                 if len(completed_list) > 100:
                     completed_list.pop(0)
-                logger.info(f"[{camera_id}] Track ID {object_id} left tracking. Total wait duration: {wait_duration:.2f}s.")
-                del active_queue[object_id]
+                logger.info(f"[{camera_id}] Track {track.track_id} removed from queue. Wait: {completed_wait:.2f}s.")
 
-        # Calculate metrics
-        queue_length = len(active_queue)
-        
-        current_wait_times = [current_time - start_t for start_t in active_queue.values()]
-        max_wait = max(current_wait_times) if current_wait_times else 0.0
-        
-        avg_wait = np.mean(current_wait_times) if current_wait_times else 0.0
+        roi_polygon = get_roi_for_camera(camera_id)
+        persons = []
+        in_queue = []
+
+        for track in tracker.active_tracks():
+            if track.misses == 0:
+                inside = _is_inside_roi(track.bottom_mid(), roi_polygon)
+                completed = track.update_queue_state(now, inside, MIN_QUEUE_HITS)
+                if completed > 0:
+                    completed_list.append(completed)
+                    if len(completed_list) > 100:
+                        completed_list.pop(0)
+                    logger.info(f"[{camera_id}] Track {track.track_id} left queue zone. Wait: {completed:.2f}s.")
+            else:
+                # Keep wait time running for briefly missed queue members.
+                track.refresh_wait_time(now)
+
+            # Only draw visible tracks; queue count still includes briefly missed members.
+            if track.misses == 0:
+                persons.append(PersonBBox(
+                    x1=int(track.bbox[0]),
+                    y1=int(track.bbox[1]),
+                    x2=int(track.bbox[2]),
+                    y2=int(track.bbox[3]),
+                    confidence=track.confidence,
+                    track_id=track.track_id,
+                    wait_time_seconds=track.wait_time,
+                    inside_roi=track.is_inside
+                ))
+
+            if track.state == "IN_QUEUE":
+                in_queue.append(track.wait_time)
+
+        queue_length = len(in_queue)
+        max_wait = max(in_queue) if in_queue else 0.0
+        avg_wait = np.mean(in_queue) if in_queue else 0.0
 
         return int(queue_length), float(avg_wait), float(max_wait), persons
 
