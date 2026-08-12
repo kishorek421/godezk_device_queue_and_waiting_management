@@ -538,4 +538,4 @@ if __name__ == "__main__":
             uvloop.install()
         except ImportError:
             pass
-    uvicorn.run(app, host="0.0.0.0", port=8014, workers=1, loop="asyncio")
+    uvicorn.run(app, host="0.0.0.0", port=8004, workers=1, loop="asyncio")
