@@ -460,6 +460,10 @@ async def detect(request: Request):
         camera_id = req.camera_id or "default"
         frame_id  = req.frame_id or str(time.time())
 
+    dep_id = request.headers.get("x-deployment-id")
+    if dep_id:
+        camera_id = f"{dep_id}:{camera_id}"
+
     try:
         loop = asyncio.get_event_loop()
         queue_len, avg_wait, max_wait, persons = await loop.run_in_executor(
@@ -482,6 +486,44 @@ async def detect(request: Request):
     except Exception as e:
         logger.error(f"Queue detection failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/reset")
+async def reset(request: Request):
+    """Reset tracker state for a specific camera, deployment, or all trackers."""
+    cam_id = request.headers.get("x-camera-id")
+    dep_id = request.headers.get("x-deployment-id")
+
+    try:
+        body = await request.json()
+        cam_id = body.get("camera_id") or cam_id
+        dep_id = body.get("deployment_id") or dep_id
+    except Exception:
+        pass
+
+    target_key = None
+    if dep_id and cam_id:
+        target_key = f"{dep_id}:{cam_id}"
+    elif cam_id:
+        target_key = cam_id
+    elif dep_id:
+        target_key = dep_id
+
+    with _state_lock:
+        if target_key:
+            keys_to_del = [k for k in list(_trackers.keys()) if k == target_key or k.startswith(f"{target_key}:") or k.endswith(f":{target_key}")]
+            for k in keys_to_del:
+                _trackers.pop(k, None)
+                _completed_waits.pop(k, None)
+                _camera_locks.pop(k, None)
+            logger.info(f"Reset trackers for target_key='{target_key}' ({len(keys_to_del)} keys removed)")
+            return {"success": True, "removed_keys": keys_to_del}
+        else:
+            count = len(_trackers)
+            _trackers.clear()
+            _completed_waits.clear()
+            _camera_locks.clear()
+            logger.info(f"Reset ALL trackers ({count} cameras cleared)")
+            return {"success": True, "cleared_all": count}
 
 @app.get("/metrics")
 async def metrics():
