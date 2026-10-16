@@ -12,7 +12,7 @@ import logging
 import time
 import threading
 import concurrent.futures
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
 
 import numpy as np
@@ -265,9 +265,13 @@ app.add_middleware(
 # ── Pydantic models ───────────────────────────────────────────
 
 class DetectRequest(BaseModel):
-    image_b64: str
-    camera_id: Optional[str] = None
-    frame_id:  Optional[str] = None
+    image_b64:    Optional[str] = None
+    camera_id:    Optional[str] = None
+    zone_id:      Optional[str] = None
+    frame_id:     Optional[str] = None
+    detections:   Optional[List[Any]] = None
+    roi_polygon:  Optional[List[List[float]]] = None
+    pre_filtered: Optional[bool] = True
 
 class PersonBBox(BaseModel):
     x1: int
@@ -336,38 +340,64 @@ def _is_inside_roi(point: tuple, roi_polygon: np.ndarray) -> bool:
     # point: (x, y)
     return cv2.pointPolygonTest(roi_polygon, (float(point[0]), float(point[1])), False) >= 0
 
-def _run_inference(img: np.ndarray, camera_id: str):
-    """Run YOLO prediction and update tracking/wait times."""
-    with _inference_lock:
-        results = _model.predict(
-            img,
-            conf=CONFIDENCE_THRESHOLD,
-            classes=[0],
-            verbose=False,
-            imgsz=INFERENCE_IMGSZ
-        )
-
-    now = time.monotonic()
-    detections = []
-    for result in results:
-        boxes = result.boxes
-        if boxes is None or len(boxes) == 0:
+def _parse_input_detections(raw_detections: List[Any]) -> List[tuple]:
+    """Parse multiple detection formats into internal [((x1, y1, x2, y2), confidence), ...]."""
+    parsed = []
+    for d in raw_detections:
+        if d is None:
             continue
-        xyxy = boxes.xyxy.cpu().int().tolist()
-        confs = boxes.conf.cpu().tolist()
-        for bbox, conf in zip(xyxy, confs):
-            detections.append(((bbox[0], bbox[1], bbox[2], bbox[3]), float(conf)))
+        conf = 0.9
+        box = None
+        if isinstance(d, (list, tuple)) and len(d) >= 4:
+            box = (float(d[0]), float(d[1]), float(d[2]), float(d[3]))
+            if len(d) >= 5 and isinstance(d[4], (int, float)):
+                conf = float(d[4])
+        elif isinstance(d, dict):
+            conf = float(d.get("confidence", d.get("score", d.get("conf", 0.9))))
+            if "x1" in d and "y1" in d and "x2" in d and "y2" in d:
+                box = (float(d["x1"]), float(d["y1"]), float(d["x2"]), float(d["y2"]))
+            elif "bbox" in d:
+                b = d["bbox"]
+                if isinstance(b, (list, tuple)) and len(b) >= 4:
+                    box = (float(b[0]), float(b[1]), float(b[2]), float(b[3]))
+                elif isinstance(b, dict):
+                    box = (
+                        float(b.get("x1", b.get("xmin", b.get("left", 0)))),
+                        float(b.get("y1", b.get("ymin", b.get("top", 0)))),
+                        float(b.get("x2", b.get("xmax", b.get("right", 0)))),
+                        float(b.get("y2", b.get("ymax", b.get("bottom", 0)))),
+                    )
+            elif "box" in d:
+                b = d["box"]
+                if isinstance(b, (list, tuple)) and len(b) >= 4:
+                    box = (float(b[0]), float(b[1]), float(b[2]), float(b[3]))
+            elif "xyxy" in d:
+                b = d["xyxy"]
+                if isinstance(b, (list, tuple)) and len(b) >= 4:
+                    box = (float(b[0]), float(b[1]), float(b[2]), float(b[3]))
+        if box:
+            parsed.append((box, conf))
+    return parsed
 
+
+def _process_detections_with_tracker(
+    detections: List[tuple],
+    tracker_key: str,
+    roi_polygon: Optional[np.ndarray] = None,
+    all_inside: bool = False
+):
+    """Process bounding boxes through tracker and state machine without model inference."""
+    now = time.monotonic()
     with _state_lock:
-        if camera_id not in _trackers:
-            _trackers[camera_id] = PersonTracker()
-            _completed_waits[camera_id] = []
-            _camera_locks[camera_id] = threading.Lock()
-        camera_lock = _camera_locks[camera_id]
+        if tracker_key not in _trackers:
+            _trackers[tracker_key] = PersonTracker()
+            _completed_waits[tracker_key] = []
+            _camera_locks[tracker_key] = threading.Lock()
+        camera_lock = _camera_locks[tracker_key]
 
     with camera_lock:
-        tracker = _trackers[camera_id]
-        completed_list = _completed_waits[camera_id]
+        tracker = _trackers[tracker_key]
+        completed_list = _completed_waits[tracker_key]
 
         removed = tracker.update(detections, now)
         for track in removed:
@@ -376,26 +406,28 @@ def _run_inference(img: np.ndarray, camera_id: str):
                 completed_list.append(completed_wait)
                 if len(completed_list) > 100:
                     completed_list.pop(0)
-                logger.info(f"[{camera_id}] Track {track.track_id} removed from queue. Wait: {completed_wait:.2f}s.")
+                logger.info(f"[{tracker_key}] Track {track.track_id} removed from queue. Wait: {completed_wait:.2f}s.")
 
-        roi_polygon = get_roi_for_camera(camera_id)
+        if roi_polygon is None and not all_inside:
+            roi_polygon = get_roi_for_camera(tracker_key)
+
         persons = []
         in_queue = []
 
         for track in tracker.active_tracks():
             if track.misses == 0:
-                inside = _is_inside_roi(track.bottom_mid(), roi_polygon)
+                inside = True if all_inside else _is_inside_roi(track.bottom_mid(), roi_polygon)
                 completed = track.update_queue_state(now, inside, MIN_QUEUE_HITS)
                 if completed > 0:
                     completed_list.append(completed)
                     if len(completed_list) > 100:
                         completed_list.pop(0)
-                    logger.info(f"[{camera_id}] Track {track.track_id} left queue zone. Wait: {completed:.2f}s.")
+                    logger.info(f"[{tracker_key}] Track {track.track_id} left queue zone. Wait: {completed:.2f}s.")
             else:
                 # Keep wait time running for briefly missed queue members.
                 track.refresh_wait_time(now)
 
-            # Only draw visible tracks; queue count still includes briefly missed members.
+            # Only report visible tracks; queue count still includes briefly missed members.
             if track.misses == 0:
                 persons.append(PersonBBox(
                     x1=int(track.bbox[0]),
@@ -416,6 +448,35 @@ def _run_inference(img: np.ndarray, camera_id: str):
         avg_wait = np.mean(in_queue) if in_queue else 0.0
 
         return int(queue_length), float(avg_wait), float(max_wait), persons
+
+
+def _run_inference(img: np.ndarray, camera_id: str):
+    """Run YOLO prediction and update tracking/wait times."""
+    with _inference_lock:
+        results = _model.predict(
+            img,
+            conf=CONFIDENCE_THRESHOLD,
+            classes=[0],
+            verbose=False,
+            imgsz=INFERENCE_IMGSZ
+        )
+
+    detections = []
+    for result in results:
+        boxes = result.boxes
+        if boxes is None or len(boxes) == 0:
+            continue
+        xyxy = boxes.xyxy.cpu().int().tolist()
+        confs = boxes.conf.cpu().tolist()
+        for bbox, conf in zip(xyxy, confs):
+            detections.append(((bbox[0], bbox[1], bbox[2], bbox[3]), float(conf)))
+
+    return _process_detections_with_tracker(
+        detections=detections,
+        tracker_key=camera_id,
+        roi_polygon=get_roi_for_camera(camera_id),
+        all_inside=False
+    )
 
 
 # ── Endpoints ─────────────────────────────────────────────────
@@ -443,32 +504,68 @@ async def ready():
 @app.post("/detect", response_model=DetectResponse)
 async def detect(request: Request):
     """Detect queue size and wait times.
-    Accepts binary JPEG (Content-Type: image/jpeg) or JSON {image_b64, camera_id?, frame_id?}."""
+    Supports 2 execution modes:
+    1. Pre-detected Zone Mode (from Workflow): JSON { camera_id, zone_id?, detections: [...], pre_filtered? }
+       -> Bypasses YOLO inference entirely; runs tracking in < 1ms for the specific zone.
+    2. Image Mode: Binary JPEG or JSON { image_b64, camera_id?, frame_id? }
+       -> Runs YOLOv11 person detection + ROI polygon check.
+    """
     detection_requests.inc()
     start = time.time()
 
     content_type = request.headers.get("content-type", "application/json")
+    req_detections = None
+    zone_id = None
+    pre_filtered = True
+    custom_roi = None
+    img = None
+
     if content_type.startswith("image/"):
         raw       = await request.body()
         img       = _decode_image(raw)
         camera_id = request.headers.get("x-camera-id", "default")
+        zone_id   = request.headers.get("x-zone-id")
         frame_id  = request.headers.get("x-frame-id", str(time.time()))
+        pre_filtered = False
     else:
         body      = await request.json()
         req       = DetectRequest(**body)
-        img       = _decode_image(base64.b64decode(req.image_b64))
         camera_id = req.camera_id or "default"
+        zone_id   = req.zone_id or request.headers.get("x-zone-id")
         frame_id  = req.frame_id or str(time.time())
+        req_detections = req.detections
+        pre_filtered = req.pre_filtered if req.pre_filtered is not None else True
+        if req.roi_polygon:
+            custom_roi = np.array(req.roi_polygon, dtype=np.int32)
+        if req.image_b64:
+            img = _decode_image(base64.b64decode(req.image_b64))
 
     dep_id = request.headers.get("x-deployment-id")
     if dep_id:
         camera_id = f"{dep_id}:{camera_id}"
 
+    tracker_key = f"{camera_id}:{zone_id}" if zone_id else camera_id
+
     try:
         loop = asyncio.get_event_loop()
-        queue_len, avg_wait, max_wait, persons = await loop.run_in_executor(
-            _thread_pool, _run_inference, img, camera_id
-        )
+        if req_detections is not None:
+            # Mode 2: Pre-detected persons from workflow! Bypasses YOLO model.
+            parsed_dets = _parse_input_detections(req_detections)
+            queue_len, avg_wait, max_wait, persons = await loop.run_in_executor(
+                _thread_pool,
+                _process_detections_with_tracker,
+                parsed_dets,
+                tracker_key,
+                custom_roi,
+                pre_filtered
+            )
+        else:
+            # Mode 1: Image provided, run full YOLO inference
+            if img is None:
+                raise HTTPException(status_code=400, detail="Either 'detections' or 'image_b64' must be provided.")
+            queue_len, avg_wait, max_wait, persons = await loop.run_in_executor(
+                _thread_pool, _run_inference, img, tracker_key
+            )
 
         elapsed = time.time() - start
         detection_latency.observe(elapsed)
@@ -478,7 +575,7 @@ async def detect(request: Request):
             queue_length=queue_len,
             average_wait_time=avg_wait,
             max_wait_time=max_wait,
-            camera_id=camera_id,
+            camera_id=tracker_key,
             frame_id=frame_id,
             persons=persons,
             processing_time_ms=elapsed * 1000,
