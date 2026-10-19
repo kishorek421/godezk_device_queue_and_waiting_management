@@ -174,6 +174,12 @@ class PersonTracker:
 
     def update(self, detections: List[tuple], now: float) -> List[Track]:
         # detections: list of ((x1,y1,x2,y2), confidence)
+        # Prune expired tracks before candidate matching so past sessions never match
+        expired = [t for t in self.tracks if (now - t.last_seen) > self.max_age_seconds]
+        for t in expired:
+            t.complete_wait(now)
+        self.tracks = [t for t in self.tracks if (now - t.last_seen) <= self.max_age_seconds]
+
         matched_track = set()
         matched_det = set()
 
@@ -272,6 +278,7 @@ class DetectRequest(BaseModel):
     detections:   Optional[List[Any]] = None
     roi_polygon:  Optional[List[List[float]]] = None
     pre_filtered: Optional[bool] = True
+    reset:        Optional[bool] = False
 
 class PersonBBox(BaseModel):
     x1: int
@@ -384,7 +391,8 @@ def _process_detections_with_tracker(
     detections: List[tuple],
     tracker_key: str,
     roi_polygon: Optional[np.ndarray] = None,
-    all_inside: bool = False
+    all_inside: bool = False,
+    reset: bool = False
 ):
     """Process bounding boxes through tracker and state machine without model inference."""
     now = time.monotonic()
@@ -398,6 +406,18 @@ def _process_detections_with_tracker(
     with camera_lock:
         tracker = _trackers[tracker_key]
         completed_list = _completed_waits[tracker_key]
+
+        # Reset session or empty zone: complete active waits and purge tracks immediately
+        if reset or len(detections) == 0:
+            for track in tracker.tracks:
+                completed_wait = track.complete_wait(now)
+                if completed_wait > 0:
+                    completed_list.append(completed_wait)
+                    if len(completed_list) > 100:
+                        completed_list.pop(0)
+                    logger.info(f"[{tracker_key}] Track {track.track_id} left queue. Wait: {completed_wait:.2f}s.")
+            tracker.tracks.clear()
+            return 0, 0.0, 0.0, []
 
         removed = tracker.update(detections, now)
         for track in removed:
@@ -417,7 +437,8 @@ def _process_detections_with_tracker(
         for track in tracker.active_tracks():
             if track.misses == 0:
                 inside = True if all_inside else _is_inside_roi(track.bottom_mid(), roi_polygon)
-                completed = track.update_queue_state(now, inside, MIN_QUEUE_HITS)
+                min_hits_threshold = 1 if all_inside else MIN_QUEUE_HITS
+                completed = track.update_queue_state(now, inside, min_hits_threshold)
                 if completed > 0:
                     completed_list.append(completed)
                     if len(completed_list) > 100:
@@ -557,7 +578,8 @@ async def detect(request: Request):
                 parsed_dets,
                 tracker_key,
                 custom_roi,
-                pre_filtered
+                pre_filtered,
+                bool(req.reset)
             )
         else:
             # Mode 1: Image provided, run full YOLO inference
