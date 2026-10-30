@@ -34,11 +34,11 @@ LOG_LEVEL            = os.environ.get("LOG_LEVEL", "INFO")
 DEFAULT_ROI = [[0, 0], [4096, 0], [4096, 4096], [0, 4096]]
 
 # Tracking / wait-time tuning
-MIN_QUEUE_HITS         = int(os.environ.get("MIN_QUEUE_HITS", "3"))
+MIN_QUEUE_HITS         = int(os.environ.get("MIN_QUEUE_HITS", "1"))
 MIN_TRACK_IOU          = float(os.environ.get("MIN_TRACK_IOU", "0.2"))
 MAX_TRACK_DISTANCE     = float(os.environ.get("MAX_TRACK_DISTANCE", "150.0"))
-MAX_TRACK_AGE          = int(os.environ.get("MAX_TRACK_AGE", "5"))
-MAX_TRACK_AGE_SECONDS  = float(os.environ.get("MAX_TRACK_AGE_SECONDS", "5.0"))
+MAX_TRACK_AGE          = int(os.environ.get("MAX_TRACK_AGE", "10"))
+MAX_TRACK_AGE_SECONDS  = float(os.environ.get("MAX_TRACK_AGE_SECONDS", "60.0"))
 INFERENCE_IMGSZ        = int(os.environ.get("INFERENCE_IMGSZ", "640"))
 
 logging.basicConfig(
